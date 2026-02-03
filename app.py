@@ -1,266 +1,221 @@
+# app.py
 import streamlit as st
 import pandas as pd
 from joblib import load
 
-st.set_page_config(page_title="Student Dropout Risk Predictor", layout="centered")
+st.set_page_config(page_title="Hotel Cancellation Predictor", layout="centered")
 
-MODEL_FILE = "gb_binary_streamlit.joblib"
-FEATURES_FILE = "gb_binary_streamlit_features.joblib"
+MODEL_PATH = "rf_model.joblib"
+COLS_PATH = "rf_feature_columns.joblib"
+
+# Load model + expected feature columns
+rf = load(MODEL_PATH)
+feature_cols = load(COLS_PATH)
+
+st.title("Hotel Booking Cancellation Predictor")
+st.caption("Predicts cancellation probability using your trained Random Forest model.")
+
+# ----------------------------
+# Helpers
+# ----------------------------
+def engineer_features(raw: dict) -> pd.DataFrame:
+    """
+    Takes a dict of raw inputs and returns a 1-row DataFrame with engineered features.
+    Mirrors your Iteration 2 feature engineering:
+      - total_nights
+      - has_special_request
+      - lead_time_group
+      - drops stays_in_* (not added to model)
+    """
+    df_in = pd.DataFrame([raw])
+
+    # total_nights from stays
+    df_in["total_nights"] = df_in["stays_in_week_nights"] + df_in["stays_in_weekend_nights"]
+
+    # has_special_request from total_of_special_requests
+    df_in["has_special_request"] = (df_in["total_of_special_requests"] > 0).astype(int)
+
+    # lead_time_group from lead_time
+    df_in["lead_time_group"] = pd.cut(
+        df_in["lead_time"],
+        bins=[-1, 30, 90, 180, 365, 1000],
+        labels=["very_short", "short", "medium", "long", "very_long"],
+    )
+
+    # Drop raw stay fields (your Iteration 2 model uses total_nights instead)
+    df_in = df_in.drop(columns=["stays_in_week_nights", "stays_in_weekend_nights"])
+
+    return df_in
 
 
-@st.cache_resource
-def load_artifacts():
-    model = load(MODEL_FILE)
-    feature_list = load(FEATURES_FILE)
-    return model, feature_list
+def prepare_for_model(df_in: pd.DataFrame) -> pd.DataFrame:
+    """
+    One-hot encodes and aligns columns to the model's training columns.
+    """
+    X_new = pd.get_dummies(df_in, drop_first=True)
+    X_new = X_new.reindex(columns=feature_cols, fill_value=0)
+    return X_new
 
 
-def yes_no_input(label: str, default_yes: bool = False, help_text: str | None = None) -> int:
-    options = ["No", "Yes"]
-    idx = 1 if default_yes else 0
-    choice = st.selectbox(label, options, index=idx, help=help_text)
-    return 1 if choice == "Yes" else 0
+def predict_one(raw: dict):
+    df_in = engineer_features(raw)
+    X_new = prepare_for_model(df_in)
+
+    proba = rf.predict_proba(X_new)[0][1]
+    pred = int(proba >= threshold)
+
+    return pred, proba
 
 
-def int_input(label: str, min_v: int, max_v: int, default: int, help_text: str | None = None) -> int:
-    return int(
-        st.number_input(
-            label,
-            min_value=min_v,
-            max_value=max_v,
-            value=default,
-            step=1,
-            help=help_text
+# ----------------------------
+# UI
+# ----------------------------
+mode = st.radio("Input mode", ["Manual form", "Upload CSV"], horizontal=True)
+threshold = st.slider("Decision threshold", 0.0, 1.0, 0.5, 0.05)
+
+st.divider()
+
+if mode == "Manual form":
+    with st.form("booking_form"):
+        # Categorical
+        hotel = st.selectbox("Hotel", ["Resort Hotel", "City Hotel"])
+        arrival_date_month = st.selectbox(
+            "Arrival month",
+            ["January", "February", "March", "April", "May", "June",
+             "July", "August", "September", "October", "November", "December"],
         )
-    )
+        meal = st.selectbox("Meal", ["BB", "HB", "FB", "SC", "Undefined"])
+        market_segment = st.selectbox(
+            "Market segment",
+            ["Direct", "Corporate", "Online TA", "Offline TA/TO", "Complementary", "Groups", "Aviation", "Undefined"],
+        )
+        distribution_channel = st.selectbox(
+            "Distribution channel",
+            ["Direct", "Corporate", "TA/TO", "GDS", "Undefined"],
+        )
+        reserved_room_type = st.selectbox("Reserved room type", ["A", "B", "C", "D", "E", "F", "G", "H", "L", "P"])
+        deposit_type = st.selectbox("Deposit type", ["No Deposit", "Non Refund", "Refundable"])
+        customer_type = st.selectbox("Customer type", ["Transient", "Transient-Party", "Contract", "Group"])
 
+        # Numeric
+        lead_time = st.number_input("Lead time (days)", min_value=0, max_value=1000, value=60, step=1)
+        arrival_date_week_number = st.number_input("Arrival week number", min_value=1, max_value=53, value=27, step=1)
+        arrival_date_day_of_month = st.number_input("Arrival day of month", min_value=1, max_value=31, value=15, step=1)
 
-def main():
-    st.title("Student Dropout Risk Predictor")
-    st.caption("Binary prediction: Dropout vs Graduate")
+        stays_in_week_nights = st.number_input("Stays in week nights", min_value=0, max_value=60, value=2, step=1)
+        stays_in_weekend_nights = st.number_input("Stays in weekend nights", min_value=0, max_value=60, value=1, step=1)
 
-    try:
-        model, feature_list = load_artifacts()
-    except Exception as e:
-        st.error("Could not load model artifacts. Ensure these files exist in the same folder:")
-        st.code(f"{MODEL_FILE}\n{FEATURES_FILE}")
-        st.exception(e)
-        return
+        adults = st.number_input("Adults", min_value=0, max_value=10, value=2, step=1)
+        children = st.number_input("Children", min_value=0.0, max_value=10.0, value=0.0, step=1.0)
+        babies = st.number_input("Babies", min_value=0, max_value=10, value=0, step=1)
 
-    st.subheader("Decision threshold")
-    threshold = st.slider(
-        "Classify as Dropout if probability ≥",
-        min_value=0.10,
-        max_value=0.90,
-        value=0.50,
-        step=0.01
-    )
+        is_repeated_guest = st.selectbox("Repeated guest", [0, 1], index=0)
+        previous_cancellations = st.number_input("Previous cancellations", min_value=0, max_value=50, value=0, step=1)
+        previous_bookings_not_canceled = st.number_input(
+            "Previous bookings not canceled", min_value=0, max_value=100, value=0, step=1
+        )
+        booking_changes = st.number_input("Booking changes", min_value=0, max_value=50, value=0, step=1)
 
-    st.divider()
-
-    # --------------------
-    # Inputs
-    # --------------------
-    inputs = {}
-
-    st.subheader("Academic performance (GPA-style input)")
-    st.caption(
-        "Singapore uses GPA (0.0–4.0). This app lets you enter GPA, then converts it into the dataset’s format.\n\n"
-        "⚠️ Note: In the training dataset, academic performance is represented more like **module pass / not-pass** "
-        "(e.g., how many modules were passed, not a true GPA). So GPA here is used as a **front-end proxy**.\n\n"
-        "Conversion used: **Pass Rate ≈ GPA ÷ 4.0**."
-    )
-
-    col1, col2 = st.columns(2)
-
-    # GPA sliders (frontend-friendly)
-    with col1:
-        gpa_sem1 = st.slider(
-            "Semester 1 GPA (0.0–4.0)",
-            0.0, 4.0, 2.8, 0.1,
-            help="Enter Semester 1 GPA on a 0.0–4.0 scale."
+        adr = st.number_input("ADR (average daily rate)", min_value=0.0, max_value=10000.0, value=120.0, step=1.0)
+        required_car_parking_spaces = st.number_input(
+            "Required car parking spaces", min_value=0, max_value=10, value=0, step=1
+        )
+        total_of_special_requests = st.number_input(
+            "Total special requests", min_value=0, max_value=10, value=0, step=1
         )
 
-    with col2:
-        gpa_sem2 = st.slider(
-            "Semester 2 GPA (0.0–4.0)",
-            0.0, 4.0, 2.8, 0.1,
-            help="Enter Semester 2 GPA on a 0.0–4.0 scale."
-        )
+        submitted = st.form_submit_button("Predict")
 
-    # Convert GPA -> pass rates (what the model expects)
-    # These map to your engineered features used in training
-    if "approval_rate_1st" in feature_list:
-        inputs["approval_rate_1st"] = gpa_sem1 / 4.0
-    if "approval_rate_2nd" in feature_list:
-        inputs["approval_rate_2nd"] = gpa_sem2 / 4.0
+    if submitted:
+        raw = {
+            "hotel": hotel,
+            "lead_time": int(lead_time),
+            "arrival_date_month": arrival_date_month,
+            "arrival_date_week_number": int(arrival_date_week_number),
+            "arrival_date_day_of_month": int(arrival_date_day_of_month),
+            "stays_in_week_nights": int(stays_in_week_nights),
+            "stays_in_weekend_nights": int(stays_in_weekend_nights),
+            "adults": int(adults),
+            "children": float(children),
+            "babies": int(babies),
+            "meal": meal,
+            "market_segment": market_segment,
+            "distribution_channel": distribution_channel,
+            "is_repeated_guest": int(is_repeated_guest),
+            "previous_cancellations": int(previous_cancellations),
+            "previous_bookings_not_canceled": int(previous_bookings_not_canceled),
+            "reserved_room_type": reserved_room_type,
+            "booking_changes": int(booking_changes),
+            "deposit_type": deposit_type,
+            "customer_type": customer_type,
+            "adr": float(adr),
+            "required_car_parking_spaces": int(required_car_parking_spaces),
+            "total_of_special_requests": int(total_of_special_requests),
+        }
 
-    # We do NOT ask for overall pass rate (redundant); compute if model expects it
-    if "approval_rate_overall" in feature_list:
-        a1 = inputs.get("approval_rate_1st", gpa_sem1 / 4.0)
-        a2 = inputs.get("approval_rate_2nd", gpa_sem2 / 4.0)
-        inputs["approval_rate_overall"] = (a1 + a2) / 2.0
+        pred, proba = predict_one(raw)
 
-    # Show the converted values for transparency (optional but helps clarity)
-    with st.expander("See conversion used (GPA → Pass Rate)", expanded=False):
-        st.write(f"Semester 1 pass-rate proxy = {gpa_sem1:.1f} ÷ 4.0 = **{gpa_sem1/4.0:.2f}**")
-        st.write(f"Semester 2 pass-rate proxy = {gpa_sem2:.1f} ÷ 4.0 = **{gpa_sem2/4.0:.2f}**")
-        if "approval_rate_overall" in feature_list:
-            st.write(f"Overall pass-rate proxy = average = **{inputs['approval_rate_overall']:.2f}**")
-
-    st.divider()
-
-    st.subheader("Academic engagement (module-based)")
-    st.caption(
-        "These fields come from the dataset and behave like **module pass/not-pass + participation signals**.\n\n"
-        "• **Assessments Taken** = how many graded assessments were attempted.\n"
-        "• **Modules Not Assessed** = modules with **no assessment record** (often indicates absent/withdraw/incomplete)."
-    )
-
-    col3, col4 = st.columns(2)
-
-    if "total_enrolled" in feature_list:
-        with col3:
-            inputs["total_enrolled"] = int_input(
-                "Total Modules Enrolled (Sem 1 + Sem 2)",
-                min_v=0, max_v=40, default=10,
-                help_text="Total number of modules enrolled across the first 2 semesters."
-            )
-
-    if "Curricular_units_2nd_sem_evaluations" in feature_list:
-        with col4:
-            inputs["Curricular_units_2nd_sem_evaluations"] = int_input(
-                "Semester 2 Assessments Taken (Count)",
-                min_v=0, max_v=60, default=10,
-                help_text="Number of graded assessments attempted in Semester 2 (tests/assignments/exams)."
-            )
-
-    col5, col6 = st.columns(2)
-
-    if "Curricular_units_1st_sem_without_evaluations" in feature_list:
-        with col5:
-            inputs["Curricular_units_1st_sem_without_evaluations"] = int_input(
-                "Semester 1 Modules Not Assessed (Count)",
-                min_v=0, max_v=40, default=0,
-                help_text=(
-                    "Number of Semester 1 modules with **no assessment record** "
-                    "(e.g., absent/withdraw/incomplete). In a pass/not-pass module view, "
-                    "a higher count often signals low engagement."
-                )
-            )
-
-    if "Curricular_units_2nd_sem_without_evaluations" in feature_list:
-        with col6:
-            inputs["Curricular_units_2nd_sem_without_evaluations"] = int_input(
-                "Semester 2 Modules Not Assessed (Count)",
-                min_v=0, max_v=40, default=0,
-                help_text=(
-                    "Number of Semester 2 modules with **no assessment record** "
-                    "(e.g., absent/withdraw/incomplete). In a pass/not-pass module view, "
-                    "a higher count often signals low engagement."
-                )
-            )
-
-    st.divider()
-
-    st.subheader("Student profile")
-    col7, col8 = st.columns(2)
-
-    if "Age" in feature_list:
-        with col7:
-            inputs["Age"] = st.slider(
-                "Age at Enrollment",
-                15, 60, 18, 1,
-                help="Student's age when enrolled."
-            )
-
-    if "Scholarship_holder" in feature_list:
-        with col8:
-            inputs["Scholarship_holder"] = yes_no_input(
-                "Scholarship Holder",
-                default_yes=False,
-                help_text="Whether the student has a scholarship."
-            )
-
-    st.divider()
-
-    st.subheader("Financial indicators")
-    col9, col10 = st.columns(2)
-
-    if "Tuition_fees_up_to_date" in feature_list:
-        with col9:
-            inputs["Tuition_fees_up_to_date"] = yes_no_input(
-                "Tuition Fees Paid Up To Date",
-                default_yes=True,
-                help_text="Yes = fees are paid. No = fees are overdue."
-            )
-
-    if "Debtor" in feature_list:
-        with col10:
-            inputs["Debtor"] = yes_no_input(
-                "Has Outstanding Debt",
-                default_yes=False,
-                help_text="Yes = student has unpaid debt recorded. No = no debt."
-            )
-
-    # Auto compute financial_risk if model expects it
-    if "financial_risk" in feature_list:
-        tuition = inputs.get("Tuition_fees_up_to_date", 1)
-        debtor = inputs.get("Debtor", 0)
-        inputs["financial_risk"] = 1 if (tuition == 0 or debtor == 1) else 0
-        st.info(f"Financial Risk (auto-computed): **{inputs['financial_risk']}**")
-
-    # Optional macro indicators (only if model expects them)
-    macro_feats = [f for f in ["GDP", "Inflation_rate", "Unemployment_rate"] if f in feature_list]
-    if macro_feats:
-        with st.expander("Optional / External factors (can leave default)", expanded=False):
-            if "GDP" in macro_feats:
-                inputs["GDP"] = float(st.number_input("GDP (Optional)", value=1.5))
-            if "Inflation_rate" in macro_feats:
-                inputs["Inflation_rate"] = float(st.number_input("Inflation Rate (Optional)", value=2.0))
-            if "Unemployment_rate" in macro_feats:
-                inputs["Unemployment_rate"] = float(st.number_input("Unemployment Rate (Optional)", value=2.0))
-
-    st.divider()
-
-    # --------------------
-    # Predict
-    # --------------------
-    if st.button("Predict"):
-        # Build row with expected columns
-        X_new = pd.DataFrame([{col: inputs.get(col, 0) for col in feature_list}])
-
-        # If model expects Course but we removed it from UI, set it to 0
-        if "Course" in feature_list:
-            X_new["Course"] = 0
-
-        # Ensure exact column order
-        X_new = X_new.reindex(columns=feature_list, fill_value=0)
-
-        try:
-            prob_dropout = float(model.predict_proba(X_new)[0][1])
-        except Exception as e:
-            st.error("Prediction failed (likely feature mismatch).")
-            st.write("Expected columns:")
-            st.code("\n".join(feature_list))
-            st.write("Row sent to model:")
-            st.dataframe(X_new)
-            st.exception(e)
-            return
-
-        pred = 1 if prob_dropout >= threshold else 0
-
-        st.subheader("Prediction result")
-        st.metric("Dropout probability", f"{prob_dropout:.3f}")
-
+        st.subheader("Result")
+        st.metric("Cancellation probability", f"{proba:.3f}")
         if pred == 1:
-            st.error("Prediction: **At risk of Dropping Out**")
+            st.error("Prediction: Canceled (1)")
         else:
-            st.success("Prediction: **Likely to Graduate**")
+            st.success("Prediction: Not canceled (0)")
 
-        with st.expander("See input row sent to the model", expanded=False):
-            st.dataframe(X_new)
+        st.caption(f"Threshold used: {threshold:.2f}")
 
+else:
+    st.write("Upload a CSV containing the booking fields (same names as the manual form fields).")
+    st.write("Required columns (minimum):")
+    st.code(
+        "hotel, lead_time, arrival_date_month, arrival_date_week_number, arrival_date_day_of_month, "
+        "stays_in_week_nights, stays_in_weekend_nights, adults, children, babies, meal, market_segment, "
+        "distribution_channel, is_repeated_guest, previous_cancellations, previous_bookings_not_canceled, "
+        "reserved_room_type, booking_changes, deposit_type, customer_type, adr, required_car_parking_spaces, "
+        "total_of_special_requests"
+    )
 
-if __name__ == "__main__":
-    main()
+    uploaded = st.file_uploader("Upload CSV", type=["csv"])
+    if uploaded is not None:
+        df_upload = pd.read_csv(uploaded)
+
+        # Basic check
+        required = [
+            "hotel", "lead_time", "arrival_date_month", "arrival_date_week_number", "arrival_date_day_of_month",
+            "stays_in_week_nights", "stays_in_weekend_nights", "adults", "children", "babies", "meal",
+            "market_segment", "distribution_channel", "is_repeated_guest", "previous_cancellations",
+            "previous_bookings_not_canceled", "reserved_room_type", "booking_changes", "deposit_type",
+            "customer_type", "adr", "required_car_parking_spaces", "total_of_special_requests"
+        ]
+        missing = [c for c in required if c not in df_upload.columns]
+        if missing:
+            st.error(f"Missing columns: {missing}")
+        else:
+            # Engineer + prepare
+            df_eng = df_upload.copy()
+            df_eng["total_nights"] = df_eng["stays_in_week_nights"] + df_eng["stays_in_weekend_nights"]
+            df_eng["has_special_request"] = (df_eng["total_of_special_requests"] > 0).astype(int)
+            df_eng["lead_time_group"] = pd.cut(
+                df_eng["lead_time"],
+                bins=[-1, 30, 90, 180, 365, 1000],
+                labels=["very_short", "short", "medium", "long", "very_long"],
+            )
+            df_eng = df_eng.drop(columns=["stays_in_week_nights", "stays_in_weekend_nights"])
+
+            X_new = prepare_for_model(df_eng)
+            proba = rf.predict_proba(X_new)[:, 1]
+            pred = (proba >= threshold).astype(int)
+
+            out = df_upload.copy()
+            out["cancel_probability"] = proba
+            out["prediction"] = pred
+
+            st.subheader("Predictions")
+            st.dataframe(out, use_container_width=True)
+
+            st.download_button(
+                "Download predictions CSV",
+                data=out.to_csv(index=False).encode("utf-8"),
+                file_name="predictions.csv",
+                mime="text/csv",
+            )
